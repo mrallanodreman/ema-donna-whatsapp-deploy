@@ -7,6 +7,7 @@ masks every secret and writes the env file atomically with 0600 permissions.
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import os
@@ -19,8 +20,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs
 
+from dotenv import dotenv_values
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
+from pydantic import ValidationError
 from pydantic.fields import FieldInfo
 
 from .config import Settings, PROJECT_ROOT
@@ -32,6 +35,18 @@ GROUP_LABELS = {
     "ig": "Instagram",
     "threads": "Threads",
 }
+
+# Estos campos son de consulta: activar envío real o cambiar la clave maestra
+# queda fuera del panel y exige editar el entorno del contenedor a mano.
+PROTECTED_FIELDS = frozenset({"EMA_LIVE", "WA_ACCESS_TOKEN", "EMA_MASTER_KEY"})
+SECRET_MARKERS = ("secret", "access_token", "password", "credential", "master_key")
+EXPANSION_RE = re.compile(r"\$(?:\{|[A-Za-z_])")
+FORWARDED_HEADERS = (
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+)
 
 DEFAULT_PROFILE = {
     "name": "Allan Odreman",
@@ -74,9 +89,9 @@ async def _form(request: Request) -> dict[str, str]:
     return {key: values[-1] for key, values in parsed.items() if values}
 
 
-def _field_kind(field: FieldInfo) -> str:
+def _field_kind(field: FieldInfo, name: str = "") -> str:
     annotation = str(field.annotation)
-    if "SecretStr" in annotation:
+    if "SecretStr" in annotation or any(marker in name.lower() for marker in SECRET_MARKERS):
         return "secret"
     if "bool" in annotation:
         return "bool"
@@ -92,7 +107,8 @@ def _field_groups(settings: Settings) -> dict[str, list[dict[str, Any]]]:
     for name, field in Settings.model_fields.items():
         prefix = name.split("_", 1)[0]
         group = prefix if prefix in GROUP_LABELS else "ema"
-        kind = _field_kind(field)
+        kind = _field_kind(field, name)
+        key = _env_key(name)
         value = getattr(settings, name)
         if kind == "secret":
             display = "••••••••" if value and value.get_secret_value() else ""
@@ -102,11 +118,12 @@ def _field_groups(settings: Settings) -> dict[str, list[dict[str, Any]]]:
             configured = bool(display)
         groups.setdefault(group, []).append(
             {
-                "key": _env_key(name),
+                "key": key,
                 "label": name,
                 "kind": kind,
                 "value": display,
                 "configured": configured,
+                "readonly": key in PROTECTED_FIELDS,
             }
         )
     for items in groups.values():
@@ -124,6 +141,13 @@ def _read_env(path: Path) -> tuple[list[str], dict[str, str]]:
         if match:
             values[match.group(1)] = match.group(2).strip()
     return lines, values
+
+
+def _env_values(path: Path) -> dict[str, str]:
+    """Read only the file, without process-environment interpolation."""
+    if not path.exists():
+        return {}
+    return {key: value for key, value in dotenv_values(path, interpolate=False).items() if value is not None}
 
 
 def _quote(value: str) -> str:
@@ -162,6 +186,8 @@ def _apply_env(
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write("\n".join(output) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         os.chmod(tmp_name, 0o600)
         os.replace(tmp_name, path)
     finally:
@@ -204,6 +230,8 @@ def _save_profile(path: Path, profile: Mapping[str, str]) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(profile, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.chmod(tmp_name, 0o600)
         os.replace(tmp_name, path)
     finally:
@@ -222,18 +250,32 @@ def _diagnostics(settings: Settings) -> list[tuple[str, str, str]]:
             "EMA_LIVE=true — envío real habilitado" if settings.ema_live else "EMA_LIVE=false — solo borradores",
         ),
         (
-            "Firma HMAC webhook",
-            "ok" if settings.secret(settings.wa_app_secret) or settings.secret(settings.meta_app_secret) else "bad",
-            "App secret disponible para verificar X-Hub-Signature-256"
-            if settings.secret(settings.wa_app_secret) or settings.secret(settings.meta_app_secret)
-            else "Falta App secret",
+            "Firma HMAC WhatsApp",
+            "ok" if settings.secret(settings.wa_app_secret) else "bad",
+            "WA_APP_SECRET disponible para /webhooks/whatsapp"
+            if settings.secret(settings.wa_app_secret)
+            else "Falta WA_APP_SECRET",
         ),
         (
-            "Verify token",
-            "ok" if settings.secret(settings.wa_webhook_verify_token) or settings.secret(settings.meta_webhook_verify_token) else "bad",
-            "Token de verificación configurado"
-            if settings.secret(settings.wa_webhook_verify_token) or settings.secret(settings.meta_webhook_verify_token)
-            else "Falta verify token",
+            "Verify token WhatsApp",
+            "ok" if settings.secret(settings.wa_webhook_verify_token) else "bad",
+            "WA_WEBHOOK_VERIFY_TOKEN configurado"
+            if settings.secret(settings.wa_webhook_verify_token)
+            else "Falta WA_WEBHOOK_VERIFY_TOKEN",
+        ),
+        (
+            "Firma HMAC Meta",
+            "ok" if settings.secret(settings.meta_app_secret) else "warn",
+            "META_APP_SECRET disponible para /webhooks/meta"
+            if settings.secret(settings.meta_app_secret)
+            else "Falta META_APP_SECRET (no afecta a WhatsApp)",
+        ),
+        (
+            "Verify token Meta",
+            "ok" if settings.secret(settings.meta_webhook_verify_token) else "warn",
+            "META_WEBHOOK_VERIFY_TOKEN configurado"
+            if settings.secret(settings.meta_webhook_verify_token)
+            else "Falta META_WEBHOOK_VERIFY_TOKEN (no afecta a WhatsApp)",
         ),
         (
             "Token de envío WA",
@@ -274,10 +316,20 @@ def _render_page(
             key = item["key"]
             kind = item["kind"]
             label = esc(item["label"])
-            if kind == "bool":
+            readonly = bool(item.get("readonly"))
+            if readonly:
+                shown = (
+                    "configurado" if kind == "secret" and item["configured"]
+                    else "pendiente" if kind == "secret"
+                    else "true" if item["value"].lower() == "true"
+                    else "false" if kind == "bool"
+                    else item["value"] or "—"
+                )
+                control = f'<span id="f-{key}" class="readonly">{esc(shown)}</span>'
+            elif kind == "bool":
                 checked = " checked" if item["value"].lower() == "true" else ""
                 control = (
-                    f'<label class="switch"><input type="checkbox" name="{key}" value="true"{checked}>'
+                    f'<label class="switch"><input id="f-{key}" type="checkbox" name="{key}" value="true"{checked}>'
                     f'<span></span></label><input type="hidden" name="__bool__{key}" value="1">'
                 )
             elif kind in {"int", "float"}:
@@ -298,6 +350,8 @@ def _render_page(
                     f'autocomplete="off" spellcheck="false">'
                 )
             badge = '<span class="tag secret">secreto</span>' if kind == "secret" else ""
+            if readonly:
+                badge += '<span class="tag lock">solo lectura</span>'
             state = '<span class="tag on">activo</span>' if item["configured"] else '<span class="tag">vacío</span>'
             rows.append(
                 f'<div class="row"><label for="f-{key}">{label}{badge}</label>'
@@ -353,6 +407,8 @@ input:focus-visible,button:focus-visible {{ outline:2px solid var(--accent); out
 .switch input:focus-visible + span {{ outline:2px solid var(--accent); outline-offset:2px; }}
 .tag {{ font-size:10px; padding:2px 7px; border-radius:99px; border:1px solid var(--line); color:var(--muted); white-space:nowrap; }}
 .tag.secret {{ color:var(--warn); border-color:#6b5423; }} .tag.on {{ color:var(--accent); border-color:#1e4b5f; }}
+.tag.lock {{ color:#c4b5fd; border-color:#554681; }}
+.readonly {{ padding:9px 11px; background:#0d1527; border:1px dashed var(--line); border-radius:9px; color:var(--muted); word-break:break-all; }}
 .clear {{ font-size:11px; color:var(--muted); white-space:nowrap; }}
 .diag {{ list-style:none; display:flex; gap:10px; padding:9px 0; border-bottom:1px solid var(--line); }}
 .diag:last-child {{ border:0; }} .diag small {{ display:block; color:var(--muted); }}
@@ -399,7 +455,8 @@ footer {{ color:var(--muted); font-size:12px; margin-top:24px; }}
   <button type="submit">Guardar configuración</button>
 </form>
 <footer>Los secretos nunca se muestran ni se rellenan: déjelos vacíos para conservarlos.
-El panel no está expuesto al túnel público; el webhook firmado sigue en
+Los campos <em>solo lectura</em> (EMA_LIVE, WA_ACCESS_TOKEN, EMA_MASTER_KEY) se cambian
+en el entorno del contenedor, no aquí. El panel no está expuesto al túnel público; el webhook firmado sigue en
 <code>https://donna.edgemarketing.tech/webhooks/whatsapp</code>.</footer>
 </div>
 </body>
@@ -421,6 +478,13 @@ def create_dashboard_app(
     csrf = secrets.token_urlsafe(32)
     app = FastAPI(title="Donna · consola local", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.csrf = csrf
+    app.state.save_lock = asyncio.Lock()
+
+    def deny(message: str) -> PlainTextResponse:
+        response = PlainTextResponse(message, status_code=403)
+        for key, value in SECURITY_HEADERS.items():
+            response.headers[key] = value
+        return response
 
     @app.middleware("http")
     async def local_only(request: Request, call_next: Any) -> Response:
@@ -428,19 +492,30 @@ def create_dashboard_app(
 
         host = request.headers.get("host", "")
         if not _is_loophost(host):
-            return PlainTextResponse("solo acceso local", status_code=403)
+            return deny("solo acceso local")
+        if any(header in request.headers for header in FORWARDED_HEADERS):
+            return deny("proxy no permitido")
         origin = request.headers.get("origin")
         if origin:
             parsed = urlparse(origin)
             if parsed.scheme not in {"http", "https"} or not _is_loophost(parsed.netloc):
-                return PlainTextResponse("origen no permitido", status_code=403)
+                return deny("origen no permitido")
         response = await call_next(request)
         for key, value in SECURITY_HEADERS.items():
             response.headers[key] = value
         return response
 
+    def current_settings() -> Settings:
+        """Build Settings from the file only; process env must not override it."""
+        if not env_file.exists():
+            return settings
+        try:
+            return Settings.model_validate(_env_values(env_file))
+        except ValidationError:
+            return settings
+
     def page(saved: bool = False) -> str:
-        current = Settings(_env_file=str(env_file)) if env_file.exists() else settings
+        current = current_settings()
         return _render_page(
             current,
             _field_groups(current),
@@ -459,11 +534,16 @@ def create_dashboard_app(
         form = await _form(request)
         if str(form.get("csrf", "")) != csrf:
             raise HTTPException(status_code=403, detail="token CSRF inválido")
-        known = {_env_key(name): field for name, field in Settings.model_fields.items()}
+        known = {
+            _env_key(name): field
+            for name, field in Settings.model_fields.items()
+            if _env_key(name) not in PROTECTED_FIELDS
+        }
         updates: dict[str, str] = {}
         clears: set[str] = set()
         for key, field in known.items():
-            if f"__clear__{key}" in form and _field_kind(field) == "secret":
+            kind = _field_kind(field, key.lower())
+            if f"__clear__{key}" in form and kind == "secret":
                 clears.add(key)
                 continue
             if f"__bool__{key}" in form:
@@ -472,12 +552,29 @@ def create_dashboard_app(
             raw = form.get(key)
             if raw is None:
                 continue
-            value = str(raw).strip()
-            if _field_kind(field) == "secret" and not value:
+            value = str(raw) if kind == "secret" else str(raw).strip()
+            if kind == "secret" and not value:
                 continue
+            if EXPANSION_RE.search(value):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"expandición de variables no soportada en {key}",
+                )
             updates[key] = value
-        changed = _apply_env(env_file, updates, clears)
-        _audit(audit_file, changed)
+
+        candidate = _env_values(env_file)
+        for key in clears:
+            candidate.pop(key, None)
+        candidate.update(updates)
+        try:
+            Settings.model_validate(candidate)
+        except ValidationError as exc:
+            bad = ", ".join(sorted({str(error["loc"][0]) for error in exc.errors()}))
+            raise HTTPException(status_code=400, detail=f"valor inválido en {bad}") from None
+
+        async with app.state.save_lock:
+            changed = _apply_env(env_file, updates, clears)
+            _audit(audit_file, changed)
         return RedirectResponse("/?saved=1", status_code=303)
 
     @app.post("/profile")
@@ -486,7 +583,8 @@ def create_dashboard_app(
         if str(form.get("csrf", "")) != csrf:
             raise HTTPException(status_code=403, detail="token CSRF inválido")
         profile = {key: str(form.get(key, ""))[:300] for key in DEFAULT_PROFILE}
-        _save_profile(profile_file, profile)
+        async with app.state.save_lock:
+            _save_profile(profile_file, profile)
         return RedirectResponse("/?saved=1", status_code=303)
 
     return app

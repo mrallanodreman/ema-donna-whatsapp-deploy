@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 
 from . import instagram, threads
@@ -190,6 +191,11 @@ def build_parser() -> argparse.ArgumentParser:
     draft_wa.add_argument("--text", required=True)
     draft_wa.add_argument("--from", dest="sender", default="593999999999")
 
+    dashboard = sub.add_parser("dashboard", help="run Donna's loopback-only config panel")
+    dashboard.add_argument("--host", default="127.0.0.1", help="must stay 127.0.0.1")
+    dashboard.add_argument("--port", type=int, default=8098)
+    dashboard.add_argument("--env-file", default=None, help="env file to inspect/edit (default: repo .env)")
+
     sub.add_parser("watch", help="run the webhook server")
     return parser
 
@@ -205,6 +211,19 @@ def main(argv: list[str] | None = None) -> None:
         from .webhooks import app
 
         uvicorn.run(app, host=settings.ema_host, port=settings.ema_port)
+        return
+
+    if args.command == "dashboard":
+        import uvicorn
+
+        from .dashboard import create_dashboard_app
+        from .config import PROJECT_ROOT
+
+        if args.host not in {"127.0.0.1", "localhost", "::1"}:
+            raise SystemExit("el panel solo puede escuchar en loopback")
+        env_file = Path(args.env_file) if args.env_file else PROJECT_ROOT / ".env"
+        dashboard_app = create_dashboard_app(settings, env_path=env_file)
+        uvicorn.run(dashboard_app, host=args.host, port=args.port, access_log=False)
         return
 
     commands = {

@@ -8,6 +8,7 @@ import logging
 import os
 import sqlite3
 from collections.abc import Awaitable, Callable, Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -60,9 +61,15 @@ class EventStore:
                 "CREATE TABLE IF NOT EXISTS events ("
                 "id TEXT PRIMARY KEY, platform TEXT, event_type TEXT, received_at TEXT)"
             )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS chat_messages ("
+                "id TEXT PRIMARY KEY, phone_number_id TEXT, sender TEXT, text TEXT, "
+                "direction TEXT, timestamp TEXT, created_at TEXT)"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
@@ -74,6 +81,90 @@ class EventStore:
                 (event_id, platform, event_type, received_at),
             )
             return cursor.rowcount == 1
+
+    def save_message(
+        self,
+        message_id: str,
+        phone_number_id: str,
+        sender: str,
+        text: str,
+        direction: str,
+        timestamp: str,
+    ) -> None:
+        """Persist a WhatsApp chat line for read-only dashboard consumption."""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO chat_messages "
+                "(id, phone_number_id, sender, text, direction, timestamp, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (message_id, phone_number_id, sender, text, direction, timestamp, utc_now()),
+            )
+
+    def list_messages(self, sender: str, phone_number_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, text, direction, timestamp, created_at FROM chat_messages "
+                "WHERE sender = ? AND phone_number_id = ? ORDER BY created_at ASC, rowid ASC",
+                (sender, phone_number_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_conversations(self, phone_number_id: str | None, limit: int) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, phone_number_id, sender, text, direction, timestamp, created_at, "
+                "ROW_NUMBER() OVER (PARTITION BY phone_number_id, sender ORDER BY created_at DESC, rowid DESC) AS rn, "
+                "COUNT(*) OVER (PARTITION BY phone_number_id, sender) AS total "
+                "FROM chat_messages WHERE (? IS NULL OR phone_number_id = ?)",
+                (phone_number_id, phone_number_id),
+            ).fetchall()
+        conversations: list[dict[str, Any]] = []
+        for row in rows:
+            if row["rn"] != 1:
+                continue
+            external_id = f"meta:whatsapp:{row['phone_number_id']}:{row['sender']}"
+            conversations.append({
+                "id": hashlib.sha256(external_id.encode()).hexdigest()[:24],
+                "leadId": None,
+                "clientAccountId": None,
+                "channel": "whatsapp",
+                "externalId": external_id,
+                "phone": row["sender"],
+                "name": "Contacto WhatsApp",
+                "lastMessage": _to_chat_message(row),
+                "messageCount": row["total"],
+                "updatedAt": _to_iso(row["timestamp"], row["created_at"]),
+            })
+        conversations.sort(key=lambda item: item["updatedAt"], reverse=True)
+        return conversations[:limit]
+
+
+def _to_iso(timestamp: str | None, created_at: str) -> str:
+    if timestamp and timestamp.isdigit():
+        try:
+            return datetime.fromtimestamp(int(timestamp), tz=timezone.utc).isoformat(timespec="seconds")
+        except (ValueError, OverflowError, OSError):
+            pass
+    return created_at
+
+
+def _to_chat_message(row: sqlite3.Row) -> dict[str, Any]:
+    direction = row["direction"]
+    return {
+        "id": row["id"],
+        "direction": "outbound" if direction == "outbound" else "inbound",
+        "from": "bot" if direction == "outbound" else "them",
+        "text": row["text"],
+        "at": _to_iso(row["timestamp"], row["created_at"]),
+        "externalId": row["id"],
+        "messageType": "text",
+        "attachmentCount": 0,
+    }
+
+
+def _chat_read_authorized(settings: Settings, authorization: str | None) -> bool:
+    expected = settings.secret(settings.wa_webhook_verify_token) or settings.secret(settings.meta_webhook_verify_token)
+    return bool(expected) and authorization == f"Bearer {expected}"
 
 
 def _fields(payload: Mapping[str, Any]) -> set[str]:
@@ -126,6 +217,38 @@ def create_app(
     @router.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @router.get("/v1/conversations")
+    async def conversations(
+        authorization: str | None = Header(default=None),
+        channel: str = Query(default="whatsapp"),
+        phoneNumberId: str | None = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=200),
+    ) -> dict[str, Any]:
+        """Read-only WhatsApp inbox for the dashboard; never sends messages."""
+        if not _chat_read_authorized(settings, authorization):
+            raise HTTPException(status_code=401, detail="unauthorized")
+        if channel not in {"whatsapp", "all"}:
+            return {"data": []}
+        return {"data": event_store.list_conversations(phoneNumberId, limit)}
+
+    @router.get("/v1/conversations/{conversation_id}")
+    async def conversation_detail(
+        conversation_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        if not _chat_read_authorized(settings, authorization):
+            raise HTTPException(status_code=401, detail="unauthorized")
+        match = next(
+            (item for item in event_store.list_conversations(None, 1000) if item["id"] == conversation_id),
+            None,
+        )
+        if not match:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        parts = str(match["externalId"]).split(":")
+        phone_number_id, sender = parts[2], parts[3]
+        messages = [_to_chat_message(item) for item in event_store.list_messages(sender, phone_number_id)]
+        return {"data": {**match, "messages": messages}}
 
     @router.get("/status")
     async def status() -> dict[str, Any]:
@@ -235,6 +358,14 @@ def create_app(
             if not event_store.is_new(event_id, event.platform, event.event_type, event.timestamp):
                 duplicates.append(event_id)
                 continue
+            event_store.save_message(
+                str(event.extra.get("message_id") or event_id),
+                event.object_id,
+                event.actor_id,
+                event.text,
+                "inbound",
+                event.timestamp,
+            )
             try:
                 draft = build_draft(event, settings)
             except DraftError as exc:
@@ -252,6 +383,15 @@ def create_app(
                 logger.exception("whatsapp send failed")
                 send_result = {"sent": False, "reason": type(exc).__name__}
             sends.append({"intent": draft["intent"], **send_result})
+            if send_result.get("sent"):
+                event_store.save_message(
+                    f"wa:out:{event.extra.get('message_id') or event_id}",
+                    event.object_id,
+                    event.actor_id,
+                    str(draft.get("text", "")),
+                    "outbound",
+                    utc_now(),
+                )
         if errors and not drafts:
             raise HTTPException(status_code=422, detail="blocked")
         return {

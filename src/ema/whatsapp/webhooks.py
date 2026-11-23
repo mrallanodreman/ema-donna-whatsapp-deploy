@@ -33,10 +33,51 @@ def normalize_event(payload: dict[str, Any]) -> list[NormalizedEvent]:
                 if isinstance(item, dict)
             }
             for message in value.get("messages", []) or []:
-                if not isinstance(message, dict) or message.get("type") != "text":
+                if not isinstance(message, dict):
                     continue
-                sender = str(message.get("from", ""))
-                text = ((message.get("text") or {}).get("body") or "").strip()
+                kind = str(message.get("type", ""))
+                code = ""
+                unsupported_type = ""
+                if kind == "text":
+                    sender = str(message.get("from", ""))
+                    text = ((message.get("text") or {}).get("body") or "").strip()
+                elif kind == "unsupported":
+                    # CTWA first messages on coexistence numbers arrive here with code
+                    # 131060 ("message currently unavailable"): keep them visible in
+                    # the inbox instead of dropping the whole webhook.
+                    errors = message.get("errors") or []
+                    if errors and isinstance(errors[0], dict):
+                        code = str(errors[0].get("code", ""))
+                    unsupported_type = str(
+                        (message.get("unsupported") or {}).get("type", "")
+                    )
+                    sender = str(message.get("from") or "")
+                    if not sender:
+                        sender = next(
+                            (
+                                str(item.get("wa_id", ""))
+                                for item in contacts
+                                if isinstance(item, dict) and item.get("wa_id")
+                            ),
+                            "",
+                        )
+                    text = (
+                        f"[Mensaje CTWA no disponible por Cloud API"
+                        f"{' (' + code + ')' if code else ''}]"
+                    )
+                else:
+                    continue
+                if not sender or not text:
+                    continue
+                extra: dict[str, Any] = {
+                    "message_id": str(message.get("id", "")),
+                    "message_type": kind,
+                    "waba_id": waba_id,
+                    "known_contact": sender in names,
+                }
+                if kind == "unsupported":
+                    extra["error_code"] = code
+                    extra["unsupported_type"] = unsupported_type
                 events.append(
                     NormalizedEvent(
                         platform="whatsapp",
@@ -46,12 +87,7 @@ def normalize_event(payload: dict[str, Any]) -> list[NormalizedEvent]:
                         target_id=waba_id,
                         timestamp=str(message.get("timestamp", "")),
                         text=text,
-                        extra={
-                            "message_id": str(message.get("id", "")),
-                            "message_type": "text",
-                            "waba_id": waba_id,
-                            "known_contact": sender in names,
-                        },
+                        extra=extra,
                     )
                 )
     return events

@@ -213,3 +213,20 @@ def test_extra_subscribed_fields_and_version_hints_do_not_break_parsing() -> Non
     assert len(events) == 1
     assert events[0].extra["message_id"] == "wamid.1"
     assert events[0].text == "quiero agendar una reunión"
+
+
+def test_unsupported_ctwa_message_is_visible() -> None:
+    """Coexistence CTWA first messages (131060) must reach the inbox."""
+    payload = json.loads(_payload())
+    message = payload["entry"][0]["changes"][0]["value"]["messages"][0]
+    message.pop("text")
+    message["type"] = "unsupported"
+    message["errors"] = [{"code": 131060, "title": "This message is currently unavailable."}]
+    message["unsupported"] = {"type": "errors"}
+
+    events = dispatch(payload)
+
+    assert len(events) == 1
+    assert events[0].extra["message_type"] == "unsupported"
+    assert events[0].extra["error_code"] == "131060"
+    assert "CTWA" in events[0].text

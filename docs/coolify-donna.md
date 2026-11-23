@@ -2,9 +2,11 @@
 
 ## Por qué no Embedded Signup
 
-La app Meta `EMA Packaging Intelligence` (`1111727731562433`) **no es Tech Provider**
-y está publicada como *Unpublished*. Embedded Signup v4 exige Tech Provider, por lo que
-el diálogo `FB.login(config_id=...)` termina en “Sorry, something went wrong.”
+La app Meta `EMA Packaging Intelligence` (`1111727731562433`) **no es Tech Provider**.
+Embedded Signup v4 exige Tech Provider, por lo que el diálogo `FB.login(config_id=...)`
+termina en “Sorry, something went wrong.”
+> Actualizado 2026-11-22: la app pasó a **Published** con 0 required actions. El texto
+> “Unpublished” de esta sección era válido el 2026-11-21; NO volver a publicar.
 
 El propio panel de la app indica la ruta correcta para número propio:
 **Use cases → Connect on WhatsApp → Integrate with API** (no *Become a Partner*).

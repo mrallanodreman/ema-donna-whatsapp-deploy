@@ -19,10 +19,12 @@ from .config import Settings, get_settings
 from .instagram import webhooks as instagram_webhooks
 from .threads import webhooks as threads_webhooks
 from .events import NormalizedEvent
-from .guardrails import AuditEvent, AuditLog
+from .guardrails import AuditEvent, AuditLog, Guardrails
+from .meta_client import MetaClient
 from .security import utc_now, verify_signature, verify_verify_token
 from .tokens import TokenStore
 from .whatsapp import webhooks as whatsapp_webhooks
+from .whatsapp.client import send_text
 from .whatsapp.drafts import DraftError, build_draft
 from .whatsapp.send import reply_to_message
 
@@ -36,6 +38,11 @@ _quota_provider: QuotaProvider | None = None
 THREADS_TYPES = frozenset(threads_webhooks.FIELD_TO_TYPE.values())
 INSTAGRAM_TYPES = frozenset(instagram_webhooks.FIELD_TO_TYPE.values())
 WHATSAPP_TYPES = frozenset(whatsapp_webhooks.FIELD_TO_TYPE.values())
+
+# Composer de prueba: solo números controlados, nunca clientes ni campañas.
+COMPOSER_PHONE_ID = "1399900609879621"
+COMPOSER_PHONE_IDS = frozenset({COMPOSER_PHONE_ID, "1056228437579212"})
+COMPOSER_RECIPIENTS = frozenset({"593979363865", "15551691701"})
 
 
 def set_event_handler(handler: EventHandler | None) -> None:
@@ -249,6 +256,65 @@ def create_app(
         phone_number_id, sender = parts[2], parts[3]
         messages = [_to_chat_message(item) for item in event_store.list_messages(sender, phone_number_id)]
         return {"data": {**match, "messages": messages}}
+
+    @router.post("/v1/conversations/{conversation_id}/messages")
+    async def send_composer_message(
+        conversation_id: str,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Human-sent, test-only WhatsApp reply. Automation never calls this."""
+        if not _chat_read_authorized(settings, authorization):
+            raise HTTPException(status_code=401, detail="unauthorized")
+        try:
+            data = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="invalid JSON") from exc
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="expected a JSON object")
+        text = str(data.get("text", "")).strip()[:1000]
+        if not text:
+            raise HTTPException(status_code=422, detail="text required")
+        match = next(
+            (item for item in event_store.list_conversations(None, 1000) if item["id"] == conversation_id),
+            None,
+        )
+        if not match:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        parts = str(match["externalId"]).split(":")
+        to = parts[3] if len(parts) == 4 else ""
+        if to not in COMPOSER_RECIPIENTS:
+            raise HTTPException(status_code=403, detail="recipient outside test allowlist")
+        phone_number_id = str(data.get("fromPhoneNumberId") or COMPOSER_PHONE_ID)
+        if phone_number_id not in COMPOSER_PHONE_IDS:
+            raise HTTPException(status_code=403, detail="sender outside test allowlist")
+        token = settings.secret(settings.wa_access_token)
+        if not token:
+            raise HTTPException(status_code=503, detail="no WA_ACCESS_TOKEN")
+
+        async def operation() -> dict[str, Any]:
+            async with MetaClient(settings.graph_base_url, timeout=settings.ema_http_timeout) as client:
+                return await send_text(client, token, phone_number_id, to, text)
+
+        decision = await Guardrails(settings, AuditLog(settings.ema_audit_file)).run(
+            "send",
+            phone_number_id,
+            {"text": text},
+            operation,
+            approve=True,
+            account=phone_number_id,
+            actor="donna-composer",
+            platform="whatsapp",
+        )
+        if not decision.allowed:
+            raise HTTPException(status_code=403, detail="send blocked by guardrails")
+        result = decision.plan.get("result")
+        messages = result.get("messages") if isinstance(result, dict) else None
+        wamid = str((messages or [{}])[0].get("id") or "")
+        if not wamid:
+            wamid = "donna:out:" + hashlib.sha256((text + utc_now()).encode()).hexdigest()[:16]
+        event_store.save_message(wamid, phone_number_id, to, text, "outbound", utc_now())
+        return {"ok": True, "messageId": wamid, "to": to, "phoneNumberId": phone_number_id}
 
     @router.get("/status")
     async def status() -> dict[str, Any]:

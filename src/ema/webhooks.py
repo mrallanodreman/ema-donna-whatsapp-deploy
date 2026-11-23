@@ -427,14 +427,25 @@ def create_app(
             if not event_store.is_new(event_id, event.platform, event.event_type, event.timestamp):
                 duplicates.append(event_id)
                 continue
+            direction = str(event.extra.get("direction", "inbound"))
+            if event.event_type == "account_update":
+                accepted.append("account_update")
+                continue
+            if not event.text or not event.actor_id:
+                continue
             event_store.save_message(
                 str(event.extra.get("message_id") or event_id),
                 event.object_id,
                 event.actor_id,
                 event.text,
-                "inbound",
+                "outbound" if direction == "outbound" else "inbound",
                 event.timestamp,
             )
+            accepted.append(f"message_{direction}")
+            # Only a real inbound customer message may create a draft/reply.
+            # Outbound echoes and history are read-only inbox records.
+            if event.event_type != "message" or direction != "inbound":
+                continue
             try:
                 draft = build_draft(event, settings)
             except DraftError as exc:

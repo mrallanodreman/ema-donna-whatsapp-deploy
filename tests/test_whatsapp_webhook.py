@@ -92,13 +92,14 @@ def test_signed_whatsapp_post_creates_draft_without_sending(settings: Settings, 
             response = await client.post("/webhooks/whatsapp", content=body, headers=_headers(body))
             assert response.status_code == 200
             result = response.json()
-            assert result["accepted"] == ["draft"]
+            assert result["accepted"] == ["message_inbound", "draft"]
             assert len(result["drafts"]) == 1
             draft = result["drafts"][0]
             assert draft["status"] == "draft" and draft["send_allowed"] is False
             assert "10:00" in draft["text"] and "(hora Quito)" in draft["text"]
-            assert len(audit.read()) == 1
-            assert audit.read()[0]["action"] == "draft_whatsapp"
+            draft_events = [event for event in audit.read() if event["action"] == "draft_whatsapp"]
+            assert len(draft_events) == 1
+            assert draft_events[0]["result"] == "draft"
 
     asyncio.run(run())
 
@@ -111,11 +112,12 @@ def test_duplicate_whatsapp_message_is_idempotent(settings: Settings) -> None:
     async def run() -> None:
         async with _client(app) as client:
             first = await client.post("/webhooks/whatsapp", content=body, headers=_headers(body))
-            assert first.json()["accepted"] == ["draft"]
+            assert first.json()["accepted"] == ["message_inbound", "draft"]
             second = await client.post("/webhooks/whatsapp", content=body, headers=_headers(body))
             assert second.json()["duplicates"]
             assert second.json()["drafts"] == []
-            assert len(audit.read()) == 1
+            draft_events = [event for event in audit.read() if event["action"] == "draft_whatsapp"]
+            assert len(draft_events) == 1
 
     asyncio.run(run())
 
@@ -210,9 +212,13 @@ def test_extra_subscribed_fields_and_version_hints_do_not_break_parsing() -> Non
         {"field": "smb_message_echoes", "value": {}},
     ])
     events = dispatch(payload)
-    assert len(events) == 1
-    assert events[0].extra["message_id"] == "wamid.1"
-    assert events[0].text == "quiero agendar una reunión"
+    messages = [event for event in events if event.event_type == "message"]
+    updates = [event for event in events if event.event_type == "account_update"]
+    assert len(messages) == 1
+    assert len(updates) == 1
+    assert messages[0].extra["message_id"] == "wamid.1"
+    assert messages[0].text == "quiero agendar una reunión"
+    assert updates[0].object_id == PHONE_ID
 
 
 def test_unsupported_ctwa_message_is_visible() -> None:
@@ -230,3 +236,76 @@ def test_unsupported_ctwa_message_is_visible() -> None:
     assert events[0].extra["message_type"] == "unsupported"
     assert events[0].extra["error_code"] == "131060"
     assert "CTWA" in events[0].text
+
+
+def _field_payload(field: str, value: dict) -> bytes:
+    return json.dumps({
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "waba-1",
+            "changes": [{"field": field, "value": value}],
+        }],
+    }).encode()
+
+
+def test_smb_message_echo_is_outbound_and_never_drafts(settings: Settings) -> None:
+    """Business app sends are read-only echoes, not customer messages."""
+    body = _field_payload("smb_message_echoes", {
+        "metadata": {"display_phone_number": "593979363865", "phone_number_id": PHONE_ID},
+        "contacts": [{"wa_id": "593963066828"}],
+        "message_echoes": [{
+            "from": "593979363865", "to": "593963066828", "id": "wamid.echo",
+            "timestamp": "1700000100", "type": "text",
+            "text": {"body": "respuesta desde la app"},
+        }],
+    })
+    app = create_app(settings, store=EventStore(settings.ema_idempotency_db))
+
+    async def run() -> None:
+        async with _client(app) as client:
+            response = await client.post("/webhooks/whatsapp", content=body, headers=_headers(body))
+            assert response.status_code == 200
+            result = response.json()
+            assert result["accepted"] == ["message_outbound"]
+            assert result["drafts"] == []
+        store = EventStore(settings.ema_idempotency_db)
+        rows = store.list_messages("593963066828", PHONE_ID)
+        assert len(rows) == 1
+        assert rows[0]["direction"] == "outbound"
+        assert rows[0]["text"] == "respuesta desde la app"
+
+    asyncio.run(run())
+
+
+def test_history_sync_records_both_directions_without_drafts(settings: Settings) -> None:
+    """History sync populates the inbox but never triggers a reply."""
+    body = _field_payload("history", {
+        "metadata": {"display_phone_number": "593979363865", "phone_number_id": PHONE_ID},
+        "history": [{
+            "metadata": {"phase": 0, "chunk_order": 1, "progress": 55},
+            "threads": [{
+                "id": "593963066828",
+                "context": {"wa_id": "593963066828"},
+                "messages": [
+                    {"from": "593979363865", "id": "wamid.h.out", "timestamp": "1700000200",
+                     "type": "text", "text": {"body": "hola desde el negocio"}},
+                    {"from": "593963066828", "id": "wamid.h.in", "timestamp": "1700000201",
+                     "type": "text", "text": {"body": "hola cliente"}},
+                ],
+            }],
+        }],
+    })
+    app = create_app(settings, store=EventStore(settings.ema_idempotency_db))
+
+    async def run() -> None:
+        async with _client(app) as client:
+            response = await client.post("/webhooks/whatsapp", content=body, headers=_headers(body))
+            assert response.status_code == 200
+            result = response.json()
+            assert result["accepted"] == ["message_outbound", "message_inbound"]
+            assert result["drafts"] == []
+        store = EventStore(settings.ema_idempotency_db)
+        rows = store.list_messages("593963066828", PHONE_ID)
+        assert {row["direction"] for row in rows} == {"inbound", "outbound"}
+
+    asyncio.run(run())

@@ -19,6 +19,7 @@ def settings(tmp_path: Path) -> Settings:
         meta_app_id="1111727731562433",
         meta_app_secret=SecretStr(APP_SECRET),
         meta_webhook_verify_token=SecretStr(VERIFY_TOKEN),
+        meta_page_id="page-1",
         wa_app_id="1111727731562433",
         wa_app_secret=SecretStr(APP_SECRET),
         wa_webhook_verify_token=SecretStr(VERIFY_TOKEN),

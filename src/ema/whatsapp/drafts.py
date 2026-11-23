@@ -30,6 +30,7 @@ _AGENDA = (
     "dispionible", "me confirma", "estoy a la espera", "pendiente",
 )
 _RECIPIENT = re.compile(r"^\+?[0-9]{7,15}$")
+_PSID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 _WEEKDAYS = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
 
@@ -108,14 +109,19 @@ def build_draft(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Build an approval-only draft. Never sends, never echoes inbound text."""
-    if event.platform != "whatsapp":
-        raise DraftError("event is not a WhatsApp message")
-    phone_id = settings.wa_phone_number_id.strip()
-    allowed = {phone_id.lower(), *settings.allowlist}
-    if not phone_id or event.object_id.lower() not in allowed:
-        raise DraftError("phone number id is not configured or allowlisted")
-    if not _RECIPIENT.fullmatch(event.actor_id):
-        raise DraftError("recipient is not a valid phone number")
+    if event.platform not in {"whatsapp", "messenger"}:
+        raise DraftError("event is not a supported Meta message")
+    is_messenger = event.platform == "messenger"
+    channel_id = (
+        settings.meta_page_id.strip() if is_messenger
+        else settings.wa_phone_number_id.strip()
+    )
+    allowed = {channel_id.lower(), *settings.allowlist} if channel_id else set(settings.allowlist)
+    if not channel_id or event.object_id.lower() not in allowed:
+        raise DraftError("channel id is not configured or allowlisted")
+    actor_pattern = _PSID if is_messenger else _RECIPIENT
+    if not actor_pattern.fullmatch(event.actor_id):
+        raise DraftError("recipient is not a valid channel id")
 
     intent = classify(event.text)
     current = now or datetime.now()
@@ -126,8 +132,10 @@ def build_draft(
 
     return {
         "status": "draft" if text else "ignored",
+        "platform": event.platform,
         "to": event.actor_id,
-        "phone_number_id": settings.wa_phone_number_id,
+        "channel_id": channel_id,
+        "phone_number_id": settings.wa_phone_number_id if not is_messenger else channel_id,
         "wamid": event.extra.get("message_id"),
         "intent": intent,
         "date": day.date().isoformat(),

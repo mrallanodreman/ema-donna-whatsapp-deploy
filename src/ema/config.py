@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     meta_webhook_verify_token: SecretStr = SecretStr("")
     meta_app_secret_proof: SecretStr | None = None
     meta_api_version: str = "v26.0"
+    meta_page_id: str = ""
 
     ema_master_key: SecretStr = SecretStr("")
     ema_live: bool = False
@@ -89,6 +90,7 @@ class Settings(BaseSettings):
             "live": self.ema_live,
             "allowlist_size": len(self.allowlist),
             "app_id_configured": bool(self.meta_app_id),
+            "meta_page_id": self.meta_page_id or None,
             "app_secret_configured": bool(self.secret(self.meta_app_secret)),
             "verify_token_configured": bool(self.secret(self.meta_webhook_verify_token)),
             "master_key_configured": bool(self.secret(self.ema_master_key)),

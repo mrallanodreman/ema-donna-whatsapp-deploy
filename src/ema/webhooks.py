@@ -17,6 +17,7 @@ from fastapi.responses import PlainTextResponse
 
 from .config import Settings, get_settings
 from .instagram import webhooks as instagram_webhooks
+from .messenger import webhooks as messenger_webhooks
 from .threads import webhooks as threads_webhooks
 from .events import NormalizedEvent
 from .guardrails import AuditEvent, AuditLog
@@ -422,8 +423,13 @@ def create_app(
         accepted: list[str] = []
         duplicates: list[str] = []
         errors: list[str] = []
-        for event in whatsapp_webhooks.normalize_event(payload):
-            event_id = f"wa:{event.extra.get('message_id')}:{body_hash}"
+        is_page = str(payload.get("object", "")).casefold() == "page"
+        normalizer = (
+            messenger_webhooks.normalize_event if is_page
+            else whatsapp_webhooks.normalize_event
+        )
+        for event in normalizer(payload):
+            event_id = f"{event.platform}:{event.extra.get('message_id')}:{body_hash}"
             if not event_store.is_new(event_id, event.platform, event.event_type, event.timestamp):
                 duplicates.append(event_id)
                 continue
@@ -446,15 +452,26 @@ def create_app(
             # Outbound echoes and history are read-only inbox records.
             if event.event_type != "message" or direction != "inbound":
                 continue
+            audit_action = (
+                "draft_messenger" if event.platform == "messenger" else "draft_whatsapp"
+            )
             try:
                 draft = build_draft(event, settings)
             except DraftError as exc:
-                audit.append(AuditEvent(utc_now(), "draft_whatsapp", event.object_id, body_hash, "blocked", "donna", type(exc).__name__))
+                audit.append(AuditEvent(utc_now(), audit_action, event.object_id, body_hash, "blocked", "donna", type(exc).__name__))
                 errors.append(type(exc).__name__)
                 continue
-            audit.append(AuditEvent(utc_now(), "draft_whatsapp", event.object_id, body_hash, draft["status"], "donna", str(draft["intent"])))
+            audit.append(AuditEvent(utc_now(), audit_action, event.object_id, body_hash, draft["status"], "donna", str(draft["intent"])))
             drafts.append(draft)
             accepted.append("draft")
+            if event.platform == "messenger":
+                # Messenger has no approval-gated auto-reply path: human only.
+                sends.append({
+                    "intent": draft["intent"],
+                    "sent": False,
+                    "reason": "messenger requires human review",
+                })
+                continue
             try:
                 send_result = await reply_to_message(
                     settings, draft, client_factory=wa_client_factory
